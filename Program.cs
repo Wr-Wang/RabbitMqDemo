@@ -6,6 +6,7 @@ using RabbitMqDemo.Entities;
 using RabbitMqDemo.Extensions;
 using RabbitMqDemo.Interfaces;
 using StackExchange.Redis;
+using System.Diagnostics;
 
 // ===== 控制台输出配置（必须放在最前面） =====
 Console.OutputEncoding = System.Text.Encoding.UTF8;
@@ -21,6 +22,7 @@ var host = Host.CreateDefaultBuilder(args)
     .ConfigureServices((ctx, services) =>
     {
         services.AddRedisIdempotent(ctx.Configuration);
+        services.AddRedisCache(ctx.Configuration);
         services.AddRabbitMqHelper();
     })
     .Build();
@@ -31,6 +33,9 @@ var lifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
 using var scope = host.Services.CreateScope();
 var mqHelper = scope.ServiceProvider.GetRequiredService<IRabbitMqHelper>();
 var msgRecordSvc = scope.ServiceProvider.GetRequiredService<IMsgRecordService>();
+
+// 缓存服务（单例，可直接从 host 解析）
+var cacheSvc = host.Services.GetRequiredService<ICacheService>();
 
 // =============================================================
 // 全局计数器 & 共享变量（在 try/finally/Block 间共享）
@@ -513,3 +518,123 @@ Console.WriteLine(broadcastCount == 2
     : $"⚠️  消息广播：期望 2，实际 {broadcastCount}");
 
 Console.WriteLine("\n========== 演示结束 ==========");
+
+// ================================================================
+// Block 10: Redis 缓存三大防护策略演示
+// ================================================================
+Console.WriteLine("\n\n╔══════════════════════════════════════════════════════════╗");
+Console.WriteLine("║    Block 10: Redis 缓存三大防护策略演示              ║");
+Console.WriteLine("║    ① 穿透防护（Cache Penetration Protection）         ║");
+Console.WriteLine("║    ② 击穿防护（Cache Breakdown Protection）          ║");
+Console.WriteLine("║    ③ 雪崩防护（Cache Avalanche Protection）          ║");
+Console.WriteLine("╚══════════════════════════════════════════════════════════╝\n");
+
+int cachePenetrationBlocked = 0;
+int cacheDbFallbackCalls = 0;
+
+Console.WriteLine("\n━━━ ① 缓存穿透防护演示 ━━━");
+Console.WriteLine("  场景：攻击者不断请求一个数据库中根本不存在的 key\n");
+
+string nonExistKey = $"nonexistent_{runTag}_data";
+for (int round = 1; round <= 5; round++)
+{
+    var penSw = Stopwatch.StartNew();
+    var result = await cacheSvc.GetOrSetAsync<string>(nonExistKey, async () =>
+    {
+        Interlocked.Increment(ref cacheDbFallbackCalls);
+        Console.WriteLine($"  ⚡ [第{round}次] 回源查询 DB → 未找到数据（返回 null）");
+        await Task.Delay(200); // 模拟 DB 查询耗时
+        return null; // 模拟数据库中也不存在
+    }, expiry: TimeSpan.FromSeconds(60));
+
+    penSw.Stop();
+
+    if (result is null)
+    {
+        Console.WriteLine($"     ↳ 第{round}次调用 → 返回 null | 耗时={penSw.ElapsedMilliseconds}ms");
+
+        if (round >= 2 && penSw.ElapsedMilliseconds < 20)
+        {
+            Interlocked.Increment(ref cachePenetrationBlocked);
+            Console.WriteLine($"     ✅ 穿透防护生效：请求被空值缓存拦截，未穿透到回源方法");
+        }
+    }
+}
+Console.WriteLine($"\n  📊 穿透防护统计：{cacheDbFallbackCalls} 次回源（实际仅第1次） | {cachePenetrationBlocked} 次被空值缓存拦截\n");
+
+Console.WriteLine("\n━━━ ② 缓存击穿防护演示 ━━━");
+Console.WriteLine("  场景：热点 key 失效，大量并发请求同时到达\n");
+
+string hotKey = $"hotkey_{runTag}_data";
+int dbCallCount = 0;
+
+var tasks = new Task<string?>[10];
+var stopwatch = Stopwatch.StartNew();
+
+for (int i = 0; i < tasks.Length; i++)
+{
+    int taskId = i;
+    tasks[i] = cacheSvc.GetOrSetAsync<string>(hotKey, async () =>
+    {
+        var count = Interlocked.Increment(ref dbCallCount);
+        Console.WriteLine($"  ⚡ [Task{taskId}] 获取锁成功，回源 DB 加载数据（回源次数#{count}）");
+        await Task.Delay(300); // 模拟 DB 查询耗时
+        return $"这是热点数据（由 Task{taskId} 加载）";
+    }, expiry: TimeSpan.FromSeconds(10));
+}
+
+var results = await Task.WhenAll(tasks);
+stopwatch.Stop();
+
+Console.WriteLine($"\n  📊 10 个并发请求 → 实际回源 {dbCallCount} 次 | 总耗时={stopwatch.ElapsedMilliseconds}ms");
+Console.WriteLine(dbCallCount == 1
+    ? "  ✅ 击穿防护生效：仅第 1 个请求回源 DB，其余 9 个等待后从缓存获取"
+    : "  ⚠️  击穿防护部分生效");
+
+// 显示所有结果
+for (int i = 0; i < results.Length; i++)
+{
+    if (i == 0 || results[i] != results[i - 1])
+        Console.WriteLine($"  Task{i} 结果: {results[i]}");
+}
+
+Console.WriteLine("\n━━━ ③ 缓存雪崩防护演示 ━━━");
+Console.WriteLine("  场景：批量缓存同时过期导致 DB 负载尖峰\n");
+Console.WriteLine("  防护策略：对每个 key 的 TTL 添加 ±25% 的随机偏移\n");
+
+Console.WriteLine("  设置 8 个缓存，统一 TTL=60s，观察实际 TTL 的随机分布：");
+for (int i = 1; i <= 8; i++)
+{
+    string batchKey = $"avalance_test_{i}_{runTag}";
+    var setSw = Stopwatch.StartNew();
+    await cacheSvc.SetAsync(batchKey, $"测试数据_{i}", TimeSpan.FromSeconds(60));
+    setSw.Stop();
+    Console.WriteLine($"  Key cache:data:avalance_test_{i}_{runTag}  TTL=60s → 设置耗时={setSw.ElapsedMilliseconds}ms");
+}
+
+// 读取实际 TTL（用 KeyTimeToLive 检查）
+using (var debugRedis = ConnectionMultiplexer.Connect(
+    (host.Services.GetRequiredService<IConfiguration>())["RedisConfig:ConnStr"]
+    ?? "127.0.0.1:6379,password=123456,defaultDatabase=0"))
+{
+    var debugDb = debugRedis.GetDatabase();
+    Console.WriteLine("\n  各 key 实际剩余 TTL（雪崩防护 Jitter 效果）：");
+    for (int i = 1; i <= 8; i++)
+    {
+        string batchKey = $"cache:data:avalance_test_{i}_{runTag}";
+        var ttl = await debugDb.KeyTimeToLiveAsync(batchKey);
+        if (ttl.HasValue)
+        {
+            Console.WriteLine($"  cache:data:avalance_test_{i}_{runTag,-5} TTL={ttl.Value.TotalSeconds:F1}s" +
+                (ttl.Value.TotalSeconds is >= 45 and <= 75 ? " ✓" : ""));
+        }
+    }
+
+    // 清理测试 key
+    for (int i = 1; i <= 8; i++)
+        await debugDb.KeyDeleteAsync($"cache:data:avalance_test_{i}_{runTag}");
+    await debugDb.KeyDeleteAsync($"cache:data:{nonExistKey}");
+    await debugDb.KeyDeleteAsync($"cache:data:{hotKey}");
+}
+
+Console.WriteLine("\n========== Block 10 缓存演示结束 ==========");

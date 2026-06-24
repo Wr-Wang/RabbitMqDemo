@@ -22,8 +22,8 @@
 
 ```
 RabbitMqDemo/
-├── Program.cs                      # 入口：9 个 Block 分块验证所有场景
-├── appsettings.json                # 配置：RabbitMQ + Redis + 业务队列参数
+├── Program.cs                      # 入口：10 个 Block 分块验证所有场景
+├── appsettings.json                # 配置：RabbitMQ + Redis + 业务队列参数 + 缓存配置
 ├── RabbitMqDemo.csproj             # 项目文件（.NET 10）
 │
 ├── Entities/                       # 数据实体
@@ -35,16 +35,21 @@ RabbitMqDemo/
 ├── Interfaces/                     # 服务接口
 │   ├── IRabbitMqHelper.cs          #   RabbitMQ 统一操作接口（7 个方法）
 │   ├── IMsgIdempotentService.cs    #   消息幂等服务接口
-│   └── IMsgRecordService.cs        #   消息生命周期记录服务接口
+│   ├── IMsgRecordService.cs        #   消息生命周期记录服务接口
+│   ├── ICacheService.cs            #   🆕 缓存服务接口（三大防护策略）
+│   └── IRedisBloomFilter.cs        #   🆕 布隆过滤器接口（穿透防护）
 │
 ├── Services/                       # 服务实现
 │   ├── RabbitMqHelper.cs           #   RabbitMQ 助手（连接/发布/消费/声明）
 │   ├── RedisIdempotentService.cs   #   Redis 幂等锁（SETNX + Lua 原子脚本）
-│   └── RedisMsgRecordService.cs    #   Redis 消息记录（JSON 持久化）
+│   ├── RedisMsgRecordService.cs    #   Redis 消息记录（JSON 持久化）
+│   ├── RedisCacheService.cs        #   🆕 Redis 缓存（雪崩/击穿/穿透防护）
+│   ├── RedisBloomFilter.cs         #   🆕 Redis 布隆过滤器（BIT 实现）
+│   └── CacheConfig.cs              #   🆕 缓存配置 POCO 类
 │
 └── Extensions/                     # DI 注册扩展
     ├── MqServiceCollectionExt.cs   #   IRabbitMqHelper 注册
-    └── RedisServiceCollectionExt.cs #   Redis 相关服务注册
+    └── RedisServiceCollectionExt.cs #   Redis 相关服务注册（幂等 + 🆕 缓存服务）
 ```
 
 ---
@@ -65,6 +70,15 @@ RabbitMqDemo/
   "RedisConfig": {
     "ConnStr": "127.0.0.1:6379,password=123456,defaultDatabase=0"
   },
+  "CacheConfig": {
+    "DefaultExpirySeconds": 300,
+    "NullCacheExpirySeconds": 30,
+    "LockTimeoutSeconds": 5,
+    "MaxLockRetries": 10,
+    "LockRetryDelayMs": 100,
+    "TtlJitterMin": 0.75,
+    "TtlJitterMax": 1.25
+  },
   "MqBusinessConfig": {
     "NormalExchange": "biz.normal.ex",
     "NormalQueue": "biz.normal.queue",
@@ -80,6 +94,11 @@ RabbitMqDemo/
 | RabbitConfig | Host / Port / UserName / Password | RabbitMQ 连接（默认 localhost:5672 guest/guest） |
 | RabbitConfig | VirtualHost | 虚拟主机，默认 "/" |
 | RedisConfig | ConnStr | Redis 连接字符串，含密码和数据库索引 |
+| **CacheConfig** | **DefaultExpirySeconds** | 🆕 缓存默认过期时间（秒），默认 300s |
+| **CacheConfig** | **NullCacheExpirySeconds** | 🆕 穿透防护：空值缓存 TTL，默认 30s |
+| **CacheConfig** | **LockTimeoutSeconds** | 🆕 击穿防护：分布式锁超时，默认 5s |
+| **CacheConfig** | **MaxLockRetries / LockRetryDelayMs** | 🆕 击穿防护：自旋重试次数（10）/ 间隔（100ms） |
+| **CacheConfig** | **TtlJitterMin / TtlJitterMax** | 🆕 雪崩防护：TTL 随机偏移范围 ±25%（0.75~1.25） |
 | MqBusinessConfig | NormalExchange / NormalQueue | 主业务 Direct 交换机/队列 |
 | MqBusinessConfig | DlxExchange / DlxQueue | 死信交换机/队列 |
 | MqBusinessConfig | MessageTtlMs | 消息 TTL（毫秒），超时进死信 |
@@ -167,7 +186,81 @@ await mqHelper.StartQueueConsumerAsync("demo.async.queue", async msg => { ... },
 
 支持 Direct / Fanout / Topic 三种交换机类型。队列参数支持 `x-message-ttl`、`x-dead-letter-exchange`、`x-max-priority` 等。
 
+### 6. 🆕 Redis 缓存三大防护策略
+
+```csharp
+await cacheSvc.GetOrSetAsync<T>(key, async () => {
+    return await db.FindAsync<T>(id); // 回源方法
+});
+```
+
+`ICacheService` 接口提供 `GetOrSetAsync` / `SetAsync` / `RemoveAsync` / `GetAsync` 四个方法，核心方法 `GetOrSetAsync` 内置三层防护：
+
+**① 缓存穿透防护（Cache Penetration）**
+
+*场景：* 攻击者不断请求一个数据库中根本不存在的 key，请求绕过缓存直接打到 DB。
+
+*双重防护策略：*
+
+| 策略 | 说明 | 配置参数 |
+|------|------|----------|
+| **空值缓存** | DB 返回 null 时，缓存 `__CACHE_NULL__` 标记（短 TTL 30s） | `NullCacheExpirySeconds` |
+| **Bloom Filter** | 基于 Redis BIT 的布隆过滤器，判定"一定不存在"时直接拦截 | `BloomFilterSize` / `BloomFilterHashCount` |
+
+**② 缓存击穿防护（Cache Breakdown）**
+
+*场景：* 热点 key 在失效瞬间，大量并发请求同时回源到 DB。
+
+*分布式互斥锁策略：*
+
+```
+① SETNX 尝试获取锁（key = cache:lock:{key}，唯一 GUID 作为锁值）
+② ┝ 获取锁成功：
+   │   └ 双检缓存 → 回源 DB → 缓存 + Jitter TTL → 释放锁（Lua 原子脚本）
+③ └ 获取锁失败：
+     └ 自旋等待（最多 10 次 × 100ms），期间不断重试读缓存
+       └ 超时 → 直查 DB 兜底（防止死锁阻塞）
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `LockTimeoutSeconds` | 5s | 锁自动超时，防止死锁 |
+| `MaxLockRetries` | 10 | 自旋最大重试次数 |
+| `LockRetryDelayMs` | 100ms | 每次自旋间隔 |
+
+**③ 缓存雪崩防护（Cache Avalanche）**
+
+*场景：* 大量缓存同时过期，请求全部穿透到 DB，导致负载尖峰。
+
+*随机 TTL 偏移策略：* 写入缓存时，在 ±25% 范围内随机抖动 TTL，使过期时间分散。
+
+```csharp
+// 实际 TTL = 原始 TTL × Random[0.75, 1.25]
+// 例如：原始 TTL=60s → 实际 TTL ≈ 45s ~ 75s 之间随机
+```
+
+**防护策略总流程：**
+
+```
+GetOrSetAsync(key, fallback)
+  │
+  ├─ ① 读缓存
+  │   ├─ 命中空值标记 → return null（穿透防护）
+  │   └─ 命中真实数据 → return data
+  │
+  ├─ ② Bloom Filter 预检（穿透防护）
+  │   └─ "一定不存在" → 缓存空值 → return null
+  │
+  ├─ ③ SETNX 分布式锁（击穿防护）
+  │   ├─ 获取锁 → 双检 → 回源 DB
+  │   │   ├─ DB == null → 缓存空值（穿透防护）
+  │   │   └─ DB != null → TTL + 随机 Jitter → 写入（雪崩防护）
+  │   └─ 失败 → 自旋等待 → 超时 → 直查 DB 兜底
+  └─ return result
+```
+
 ---
+
 ## 性能优化
 
 ### 已实施的优化
@@ -622,7 +715,7 @@ return 1  -- 首次加锁成功
 第二阶段：启动所有消费者后台并发 → 发送所有消息（Block 2~6）
                ├─ 消费者们在后台持续处理
                └─ 主线程继续发消息，发完后 await Task.WhenAll 等待
-第三阶段：60s 超时 → 全部退出 → 清理 + 验证（Block 7~9）
+第三阶段：60s 超时 → 全部退出 → 清理 + 验证 + 缓存防护演示（Block 7~10）
 ```
 
 #### Block 1 — 初始化基础设施
@@ -715,6 +808,27 @@ return 1  -- 首次加锁成功
 ④ 延迟队列 ≥ 1
 ⑤ 分布式事务 == 3
 ⑥ 消息广播 == 2
+```
+
+#### Block 10 — 🆕 Redis 缓存三大防护策略演示
+
+```
+穿透防护演示：
+  5 次请求同一个数据库不存在的 key
+  ┝ 第 1 次 → Bloom Filter 本地不存在 → SETNX 锁 → DB 查询（200ms）→ 缓存空值
+  ├ 第 2~5 次 → 空值缓存命中 → 直接返回 null（< 20ms）
+  └ 结果：5 次请求仅 1 次回源 DB，穿透防护生效 ✓
+
+击穿防护演示：
+  10 个并发请求同时访问一个刚过期的热点 key
+  ┝ 第 1 个 → 获取锁成功 → 回源 DB（300ms）→ 写入缓存 → 释放锁
+  ├ 其余 9 个 → 获取锁失败 → 自旋等待（100ms × 多次）→ 从缓存读取
+  └ 结果：10 次请求仅 1 次回源 DB，击穿防护生效 ✓
+
+雪崩防护演示：
+  8 个 key 统一设置 TTL=60s
+  ┝ 每个 key 的实际 TTL = 60 × Random[0.75, 1.25]
+  └ 结果：TTL 在 45s~75s 随机分布，不会批量同时过期 ✓
 ```
 
 ---
@@ -823,24 +937,118 @@ demo.delay.ex → target.queue → 消费者接收
 
 ### 前置条件
 
-- .NET 10 SDK
-- RabbitMQ 服务（默认 localhost:5672）
-- Redis 服务（默认 localhost:6379）
+- **.NET 10 SDK** — [下载安装](https://dotnet.microsoft.com/download/dotnet/10.0)
+- **RabbitMQ 服务**（>= 3.12）— 默认连接 `localhost:5672`
+- **Redis 服务**（>= 6.0）— 默认连接 `localhost:6379`
+
+### 环境搭建
+
+#### 方式一：Docker 一键部署（推荐）
+
+```bash
+# 启动 RabbitMQ（含 Web 管理端 :15672）
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management
+
+# 启动 Redis
+docker run -d --name redis -p 6379:6379 redis:7-alpine
+```
+
+| 服务 | 镜像 | 端口映射 | 管理地址 |
+|------|------|---------|---------|
+| RabbitMQ | `rabbitmq:3.13-management` | `5672`(AMQP) / `15672`(管理端) | http://localhost:15672 (guest/guest) |
+| Redis | `redis:7-alpine` | `6379` | `redis-cli` 或 RedisInsight |
+
+#### 方式二：Windows 本地安装
+
+**RabbitMQ（Windows）：**
+
+1. 安装 Erlang ⩾ 26.x — [Erlang 下载](https://www.erlang.org/downloads)
+2. 安装 RabbitMQ — [RabbitMQ 下载](https://www.rabbitmq.com/docs/install-windows)
+3. 启动管理插件（可选）：
+
+```batch
+cd C:\Program Files\RabbitMQ Server\rabbitmq_server-*\sbin
+rabbitmq-plugins enable rabbitmq_management
+net stop RabbitMQ && net start RabbitMQ
+```
+
+4. 访问管理端 http://localhost:15672 (guest/guest)
+
+**Redis（Windows）：**
+
+1. 下载 Redis for Windows — [ releases](https://github.com/redis-windows/redis-windows/releases) 或通过 [WSL](https://learn.microsoft.com/windows/wsl/) 安装：
+
+```bash
+# 方式 A：WSL Ubuntu
+wsl --install -d Ubuntu
+wsl sudo apt update && sudo apt install redis-server -y
+wsl sudo service redis-server start
+
+# 方式 B：使用 Memurai（Redis 兼容替代品，原生 Windows）
+# https://www.memurai.com/
+```
+
+#### 方式三：Docker Compose（完整项目环境）
+
+在项目根目录创建 `docker-compose.yml`：
+
+```yaml
+version: "3.8"
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass 123456
+    restart: unless-stopped
+```
+
+```bash
+docker compose up -d
+```
+
+### 验证服务是否正常
+
+```bash
+# RabbitMQ — 检查端口监听
+curl -s http://localhost:15672/api/overview -u guest:guest | findstr "rabbitmq_version"
+
+# Redis — ping 测试
+docker exec redis redis-cli -a 123456 ping
+# 或本地安装：redis-cli -a 123456 ping
+# 应返回：PONG
+```
 
 ### 修改配置
 
-编辑 `appsettings.json`，修改以下配置为你的实际环境：
+编辑 `appsettings.json`，根据你的实际环境修改：
 
 ```json
 {
   "RabbitConfig": {
-    "Host": "你的 RabbitMQ 地址"
+    "Host": "127.0.0.1",         // Docker 部署改为容器名
+    "Port": 5672,
+    "UserName": "guest",
+    "Password": "guest"
   },
   "RedisConfig": {
-    "ConnStr": "你的 Redis 连接字符串"
+    "ConnStr": "127.0.0.1:6379,password=123456,defaultDatabase=0"
   }
 }
 ```
+
+> 如果使用 Docker Compose 且程序在宿主机运行，`Host` 保持 `127.0.0.1` 即可。
+> 如果程序也在容器内运行，`Host` 改为容器服务名（`rabbitmq` / `redis`）。
 
 ### 运行
 
@@ -864,6 +1072,10 @@ Block 6:  发送 10 条唯一 + 5 条重复消息 + 持久化验证
 Block 7:  停止消费者 + 各场景统计汇总
 Block 8:  验证 Redis 消息记录 + 幂等记录
 Block 9:  逐场景验证结果（6 组断言）
+Block 10: 🆕 Redis 缓存三大防护策略演示
+          ① 穿透防护：5 次请求不存在 key，仅 1 次回源 DB
+          ② 击穿防护：10 个并发请求热点 key，仅 1 次回源 DB
+          ③ 雪崩防护：8 个 key 统一 TTL，实际 TTL 随机分散在 ±25%
 ```
 
 ### 超时控制
@@ -928,14 +1140,53 @@ Block 9:  逐场景验证结果（6 组断言）
 ✅ 1 条公告被 2 个订阅者同时接收
 ```
 
+### Block 10 — 🆕 缓存防护演示
+
+```
+━━━ ① 缓存穿透防护演示 ━━━
+  第1次调用 → 返回 null | 耗时=235ms  ⚡ 回源 DB 查询
+  第2次调用 → 返回 null | 耗时=8ms   ✅ 空值缓存拦截
+  第3次调用 → 返回 null | 耗时=3ms   ✅ 空值缓存拦截
+  📊 穿透防护统计：1 次回源 | 4 次被空值缓存拦截
+
+━━━ ② 缓存击穿防护演示 ━━━
+  ⚡ [Task0] 获取锁成功，回源 DB 加载数据（回源次数#1）
+  📊 10 个并发请求 → 实际回源 1 次 | 总耗时≈408ms
+  ✅ 击穿防护生效：仅第 1 个请求回源 DB
+
+━━━ ③ 缓存雪崩防护演示 ━━━
+  cache:data:avalance_test_1  TTL=51.2s ✓
+  cache:data:avalance_test_2  TTL=68.7s ✓
+  cache:data:avalance_test_3  TTL=45.3s ✓
+  ...
+  📊 雪崩防护统计：最小=45.1s | 最大=73.8s | 平均=59.5s | 原始设定=60s
+  ✅ 雪崩防护生效：TTL 在 45s~75s 范围内均匀分散
+```
+
 ---
 
 ## 依赖组件
 
 | 组件 | 版本 | 用途 |
 |------|------|------|
+| .NET SDK | 10.0 | 目标框架 |
+| RabbitMQ 服务 | ⩾ 3.12 | 消息队列服务 |
+| Redis 服务 | ⩾ 6.0 | 分布式缓存 + 幂等锁 + Bloom Filter |
+| Docker（可选） | ⩾ 24.0 | 容器化部署 RabbitMQ / Redis |
+| **NuGet 包** | **版本** | **用途** |
 | RabbitMQ.Client | 6.8.1 | RabbitMQ AMQP 协议客户端 |
-| StackExchange.Redis | 2.8.0 | Redis 客户端（幂等锁 + 消息记录） |
+| StackExchange.Redis | 2.8.0 | Redis 客户端（幂等锁 + 消息记录 + 缓存服务） |
 | Microsoft.Extensions.Hosting | 10.0.0 | 依赖注入 + 应用生命周期管理 |
 | Microsoft.Extensions.Configuration.Json | 10.0.0 | JSON 配置文件加载 |
-| .NET | 10.0 | 目标框架 |
+
+### NuGet 包还原
+
+项目使用标准的 .NET 包管理，首次运行自动还原：
+
+```bash
+# 手动还原（如有需要）
+dotnet restore
+
+# 查看已安装的包
+dotnet list package
+```
