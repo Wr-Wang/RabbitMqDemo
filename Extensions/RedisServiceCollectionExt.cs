@@ -35,6 +35,9 @@ namespace RabbitMqDemo.Extensions
 
             // 注册幂等服务（单例，共享同一个 Redis 连接）
             services.AddSingleton<IMsgIdempotentService, RedisIdempotentService>();
+
+            // 注册消息记录服务（单例，用于全生命周期持久化追踪）
+            services.AddSingleton<IMsgRecordService, RedisMsgRecordService>();
             return services;
         }
     }

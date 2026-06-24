@@ -33,5 +33,14 @@ namespace RabbitMqDemo.Interfaces
         /// <param name="businessHandler">业务处理委托（true=成功ACK, false=失败Nack重试）</param>
         /// <param name="cancellationToken">取消令牌，用于优雅关闭</param>
         Task StartConsumeAsync(Func<MqMessage, Task<bool>> businessHandler, CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// 启动死信队列消费者
+        /// 自动消费已进入死信队列的消息，支持自定义业务处理
+        /// 默认行为：记录死信消息并确认（从队列移除）
+        /// </summary>
+        /// <param name="businessHandler">可选死信处理委托（true=确认删除, false=拒绝丢弃）</param>
+        /// <param name="cancellationToken">取消令牌，用于优雅关闭</param>
+        Task StartDlxConsumeAsync(Func<MqMessage, Task<bool>>? businessHandler = null, CancellationToken cancellationToken = default);
     }
 }

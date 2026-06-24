@@ -15,9 +15,11 @@ namespace RabbitMqDemo.Services
         // ========== 私有字段 ==========
         private readonly IConfiguration _config;              // 配置源（读取 appsettings.json）
         private readonly IMsgIdempotentService _idempotentSvc; // Redis 幂等服务
+        private readonly IMsgRecordService _msgRecordSvc;      // 消息生命周期记录服务
         private IConnection? _conn;                           // RabbitMQ 连接（自动恢复启用）
         private IModel? _publishChannel;                      // 发布专用通道（Confirm 模式）
         private IModel? _consumeChannel;                      // 消费专用通道（手动 ACK）
+        private IModel? _dlxChannel;                          // 死信队列消费通道
         private readonly string _normalEx, _normalQueue;      // 普通交换机/队列名
         private readonly string _dlxEx, _dlxQueue;            // 死信交换机/队列名
         private readonly int _globalTtlMs;                    // 全局消息 TTL（毫秒）
@@ -26,10 +28,11 @@ namespace RabbitMqDemo.Services
         /// <summary>
         /// 构造函数：读取配置 → 建立连接 → 创建发布通道
         /// </summary>
-        public RabbitMqHelper(IConfiguration config, IMsgIdempotentService idempotentSvc)
+        public RabbitMqHelper(IConfiguration config, IMsgIdempotentService idempotentSvc, IMsgRecordService msgRecordSvc)
         {
             _config = config;
             _idempotentSvc = idempotentSvc;
+            _msgRecordSvc = msgRecordSvc;
 
             // 从 MqBusinessConfig 节读取交换机/队列/TTL 配置
             var mqBizCfg = _config.GetSection("MqBusinessConfig");
@@ -141,6 +144,10 @@ namespace RabbitMqDemo.Services
             // 使用 Task.Run 避免阻塞 async 调用方线程
             await Task.Run(() => _publishChannel.WaitForConfirmsOrDie(TimeSpan.FromSeconds(5)));
 
+            // 持久化消息记录到 Redis（记录失败不影响消息本身）
+            try { await _msgRecordSvc.CreateMessageRecordAsync(msg); }
+            catch { Console.WriteLine($"[记录] {msg.MsgId} 持久化失败（Redis 不可用）"); }
+
             Console.WriteLine($"[消息已确认送达] {msg.MsgId}");
         }
 
@@ -193,6 +200,8 @@ namespace RabbitMqDemo.Services
                     {
                         // Redis 中已存在 Finished=true 的记录 → 跳过处理
                         Console.WriteLine($"[幂等拦截] {msg.MsgId} 重复，ACK跳过");
+                        // 记录：幂等跳过
+                        try { _msgRecordSvc.UpdateStatusAsync(msg.MsgId, MessageStatuses.IdempotentSkipped).GetAwaiter().GetResult(); } catch { }
                         _consumeChannel.BasicAck(tag, false);
                         return;
                     }
@@ -203,6 +212,8 @@ namespace RabbitMqDemo.Services
                     {
                         // 业务成功 → 标记幂等完成 + ACK 确认
                         _idempotentSvc.MarkFinishAsync(msg.MsgId).GetAwaiter().GetResult();
+                        // 记录：已消费
+                        try { _msgRecordSvc.UpdateStatusAsync(msg.MsgId, MessageStatuses.Consumed).GetAwaiter().GetResult(); } catch { }
                         _consumeChannel.BasicAck(tag, false);
                         Console.WriteLine($"[消费成功] {msg.MsgId}");
                     }
@@ -210,8 +221,17 @@ namespace RabbitMqDemo.Services
                     {
                         // 业务失败 → 释放幂等锁 + Nack 重新入队（超时后进死信）
                         _idempotentSvc.UnLockMsgAsync(msg.MsgId).GetAwaiter().GetResult();
+                        // 记录：消费失败 + 累加重试次数
+                        int currentRetry = 0;
+                        try
+                        {
+                            var rec = _msgRecordSvc.GetMessageRecordAsync(msg.MsgId).GetAwaiter().GetResult();
+                            currentRetry = (rec?.RetryCount ?? 0) + 1;
+                            _msgRecordSvc.UpdateStatusAsync(msg.MsgId, MessageStatuses.ConsumerFailed, currentRetry).GetAwaiter().GetResult();
+                        }
+                        catch { }
                         _consumeChannel.BasicNack(tag, false, requeue: true);
-                        Console.WriteLine($"[消费失败] {msg.MsgId} Nack重试");
+                        Console.WriteLine($"[消费失败] {msg.MsgId} Nack重试 (第{currentRetry}次)");
                     }
                 }
                 catch (Exception ex)
@@ -240,6 +260,113 @@ namespace RabbitMqDemo.Services
             }
         }
 
+        // ========== 死信队列消费 ==========
+
+        /// <summary>
+        /// 启动死信队列消费者
+        ///
+        /// 消费流程：
+        ///   1. 从死信队列接收消息（源自 Nack 重试超时的业务消息）
+        ///   2. 反序列化并调用外部处理委托
+        ///   3. 处理成功 Ack 移除，失败 Nack 丢弃（不进二次死信）
+        /// </summary>
+        /// <param name="businessHandler">可选死信处理委托（null=仅记录）, true=确认删除, false=拒绝丢弃</param>
+        /// <param name="cancellationToken">取消令牌</param>
+        public async Task StartDlxConsumeAsync(Func<MqMessage, Task<bool>>? businessHandler = null, CancellationToken cancellationToken = default)
+        {
+            _dlxChannel = _conn!.CreateModel();
+            _dlxChannel.BasicQos(0, 1, false);
+
+            var consumer = new EventingBasicConsumer(_dlxChannel);
+            consumer.Received += (_, ea) =>
+            {
+                var tag = ea.DeliveryTag;
+                try
+                {
+                    // ---- 1. 反序列化 ----
+                    var json = System.Text.Encoding.UTF8.GetString(ea.Body.ToArray());
+                    var msg = JsonSerializer.Deserialize<MqMessage>(json);
+                    if (msg == null)
+                    {
+                        Console.WriteLine("[DLQ] 反序列化失败，Nack丢弃");
+                        _dlxChannel.BasicNack(tag, false, false);
+                        return;
+                    }
+
+                    Console.WriteLine($"\n[DLQ→收到死信] MsgId={msg.MsgId} Data={msg.Data} CreateTs={msg.CreateTs}");
+
+                    // 提取死信原因头（x-death），显示原始路由和重试次数
+                    if (ea.BasicProperties?.Headers != null &&
+                        ea.BasicProperties.Headers.TryGetValue("x-death", out var xDeathRaw))
+                    {
+                        try
+                        {
+                            // x-death 是嵌套列表，取第一条简要信息
+                            var deathList = xDeathRaw as List<object>;
+                            if (deathList?.Count > 0)
+                            {
+                                var firstDeath = deathList[0] as Dictionary<string, object>;
+                                if (firstDeath != null)
+                                {
+                                    var reason = firstDeath.TryGetValue("reason", out var r) ? r : "expired";
+                                    var count = firstDeath.TryGetValue("count", out var c) ? c : "?";
+                                    var q = firstDeath.TryGetValue("queue", out var qq) ? qq : "?";
+                                    Console.WriteLine($"  [死信原因] reason={reason} | 原队列={q} | 重试次数={count}");
+                                }
+                            }
+                        }
+                        catch { /* 头信息解析失败不影响主流程 */ }
+                    }
+
+                    // 记录：已进死信（在执行业务处理前记录，确保死信事实不被遗漏）
+                    try
+                    {
+                        var drec = _msgRecordSvc.GetMessageRecordAsync(msg.MsgId).GetAwaiter().GetResult();
+                        int dlqRetry = drec?.RetryCount ?? 0;
+                        _msgRecordSvc.UpdateStatusAsync(msg.MsgId, MessageStatuses.DeadLettered, dlqRetry).GetAwaiter().GetResult();
+                    }
+                    catch { }
+
+                    // ---- 2. 执行业务处理 ----
+                    bool success = true;
+                    if (businessHandler != null)
+                    {
+                        success = businessHandler(msg).GetAwaiter().GetResult();
+                    }
+
+                    if (success)
+                    {
+                        _dlxChannel.BasicAck(tag, false);
+                        Console.WriteLine($"[DLQ✓] {msg.MsgId} 死信处理完成，已确认");
+                    }
+                    else
+                    {
+                        _dlxChannel.BasicNack(tag, false, false);
+                        Console.WriteLine($"[DLQ✗] {msg.MsgId} 死信处理失败，已丢弃");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[DLQ异常] tag={tag} {ex.GetType().Name}: {ex.Message}");
+                    try { _dlxChannel.BasicNack(tag, false, false); } catch { }
+                }
+            };
+
+            // 注册消费者（autoAck=false：手动确认）
+            _dlxChannel.BasicConsume(_dlxQueue, autoAck: false, consumer: consumer);
+            Console.WriteLine("死信队列消费者已启动，等待死信消息...\n");
+
+            // 阻塞直到外部传入取消令牌
+            try
+            {
+                await Task.Delay(-1, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine("\n死信消费者收到关闭信号，正在退出...");
+            }
+        }
+
         // ========== 资源释放 ==========
 
         /// <summary>
@@ -250,6 +377,7 @@ namespace RabbitMqDemo.Services
             if (_disposed) return;
             _publishChannel?.Close();
             _consumeChannel?.Close();
+            _dlxChannel?.Close();
             _conn?.Close();
             _conn?.Dispose();
             _disposed = true;

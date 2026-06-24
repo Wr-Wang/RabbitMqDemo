@@ -14,7 +14,7 @@ namespace RabbitMqDemo.Entities
         /// <summary>业务数据（JSON 字符串或纯文本）</summary>
         public string Data { get; set; } = string.Empty;
 
-        /// <summary>消息生成时间戳（Unix 毫秒，UTC）</summary>
-        public long CreateTs { get; set; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        /// <summary>消息生成时间（格式：yyyy.MM.dd HH:mm:ss.fff，本地时间）</summary>
+        public string CreateTs { get; set; } = DateTime.Now.ToString("yyyy.MM.dd HH:mm:ss.fff");
     }
 }
