@@ -1,15 +1,20 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
-
 namespace RabbitMqDemo.Entities
 {
-    /// <summary>Redis存储幂等记录</summary>
+    /// <summary>
+    /// Redis 幂等记录
+    ///
+    /// 序列化为 JSON 存储在 Redis，camelCase 命名：
+    ///   {"finished":true}
+    ///
+    /// 注意：Lua 脚本中用 record['finished']（小写 f）访问
+    /// </summary>
     public class IdempotentRecord
     {
-        /// <summary>true=已消费完成；false=处理中</summary>
+        /// <summary>
+        /// 消费完成标志
+        /// true  = 已消费完成（重复消息直接跳过）
+        /// false = 处理中（首次 或 崩溃后重新处理）
+        /// </summary>
         public bool Finished { get; set; }
-        /// <summary>记录过期时间戳</summary>
-        public long ExpireTs { get; set; }
     }
 }
